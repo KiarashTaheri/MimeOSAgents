@@ -14,18 +14,38 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
-MGDL_PER_MMOLL = 18.0182
+MGDL_PER_MMOLL = 18.0182  # glucose molar mass (180.16 g/mol) / 10
 READING_INTERVAL_MIN = 5  # Dexcom / Libre sample every 5 (or 15) minutes
+MINUTES_PER_HOUR = 60
+MINUTES_PER_DAY = 24 * MINUTES_PER_HOUR
 
+# Consensus thresholds (mmol/L): 54 / 70 / 180 / 250 mg/dL.
 VERY_LOW, LOW, HIGH, VERY_HIGH = 3.0, 3.9, 10.0, 13.9
-MIN_EVENT_MINUTES = 15
+MIN_EVENT_MINUTES = 15  # consensus minimum duration of a low/high episode
+STABLE_CV_PCT = 36  # consensus: CV at or below this is stable glucose
+# A gap of more than this many sample intervals (sensor dropout) ends an episode.
+MAX_EVENT_GAP_INTERVALS = 2
+
+# Plausible reading range (20-600 mg/dL); anything outside is treated as a bad row.
+MIN_VALID_MMOL_L, MAX_VALID_MMOL_L = 1.1, 33.3
+# Dexcom writes 'Low'/'High' outside its measurable range (40 / 400 mg/dL).
+SENSOR_LOW_MMOL_L, SENSOR_HIGH_MMOL_L = 2.2, 22.2
+
+# Glucose Management Indicator (Bergenstal et al. 2018).
+GMI_PCT_INTERCEPT, GMI_PCT_PER_MGDL = 3.31, 0.02392  # GMI(%) from mean glucose in mg/dL
+GMI_MMOL_MOL_INTERCEPT, GMI_MMOL_MOL_PER_MMOLL = 12.71, 4.70587  # GMI(mmol/mol) from mean in mmol/L
+
+# Time-of-day buckets: overnight 00-06, morning 06-12, afternoon 12-18, evening 18-24.
+MORNING_START_HOUR, AFTERNOON_START_HOUR, EVENING_START_HOUR = 6, 12, 18
+
+OUTPUT_DECIMALS = 1  # values the model quotes, and the evals match, are rounded to this
 
 TimeOfDay = Literal["overnight", "morning", "afternoon", "evening"]
 
 
 class GlucoseReading(BaseModel):
     timestamp: datetime
-    mmol_l: float = Field(ge=1.1, le=33.3)
+    mmol_l: float = Field(ge=MIN_VALID_MMOL_L, le=MAX_VALID_MMOL_L)
 
 
 class CGMData(BaseModel):
@@ -34,12 +54,12 @@ class CGMData(BaseModel):
     source_format: Literal["simple", "dexcom"] = "simple"
 
 
-def time_of_day(ts: datetime) -> TimeOfDay:
-    if ts.hour < 6:
+def time_of_day(timestamp: datetime) -> TimeOfDay:
+    if timestamp.hour < MORNING_START_HOUR:
         return "overnight"
-    if ts.hour < 12:
+    if timestamp.hour < AFTERNOON_START_HOUR:
         return "morning"
-    if ts.hour < 18:
+    if timestamp.hour < EVENING_START_HOUR:
         return "afternoon"
     return "evening"
 
@@ -47,14 +67,14 @@ def time_of_day(ts: datetime) -> TimeOfDay:
 # --------------------------------------------------------------------------- loading
 
 
-def _parse_dexcom_value(raw: str, unit: Literal["mmol", "mgdl"]) -> float:
+def _parse_dexcom_value(raw_value: str, unit: Literal["mmol", "mgdl"]) -> float:
     """Dexcom writes 'Low'/'High' when outside the sensor's measurable range."""
-    raw = raw.strip()
-    if raw.lower() == "low":
-        return 2.2
-    if raw.lower() == "high":
-        return 22.2
-    value = float(raw)
+    raw_value = raw_value.strip().lower()
+    if raw_value == "low":
+        return SENSOR_LOW_MMOL_L
+    if raw_value == "high":
+        return SENSOR_HIGH_MMOL_L
+    value = float(raw_value)
     return value / MGDL_PER_MMOLL if unit == "mgdl" else value
 
 
@@ -63,26 +83,26 @@ def load_cgm(path: Path | str) -> CGMData:
 
     Rows that fail to parse or validate are skipped and counted rather than aborting the load.
     """
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        rows = list(csv.DictReader(f))
+    with open(path, newline="", encoding="utf-8-sig") as csv_file:
+        rows = list(csv.DictReader(csv_file))
     if not rows:
         raise ValueError(f"No rows found in CGM file {path}")
 
     columns = rows[0].keys()
     readings: list[GlucoseReading] = []
-    skipped = 0
+    skipped_rows = 0
 
     if "glucose_mmol_l" in columns:
-        fmt: Literal["simple", "dexcom"] = "simple"
+        source_format: Literal["simple", "dexcom"] = "simple"
         for row in rows:
             try:
                 readings.append(GlucoseReading(timestamp=row["timestamp"], mmol_l=row["glucose_mmol_l"]))
             except (ValidationError, KeyError):
-                skipped += 1
+                skipped_rows += 1
     elif "Timestamp (YYYY-MM-DDThh:mm:ss)" in columns:
-        fmt = "dexcom"
+        source_format = "dexcom"
         unit: Literal["mmol", "mgdl"] = "mmol" if "Glucose Value (mmol/L)" in columns else "mgdl"
-        value_col = "Glucose Value (mmol/L)" if unit == "mmol" else "Glucose Value (mg/dL)"
+        value_column = "Glucose Value (mmol/L)" if unit == "mmol" else "Glucose Value (mg/dL)"
         for row in rows:
             if row.get("Event Type") != "EGV":  # header/metadata/calibration rows
                 continue
@@ -90,18 +110,18 @@ def load_cgm(path: Path | str) -> CGMData:
                 readings.append(
                     GlucoseReading(
                         timestamp=row["Timestamp (YYYY-MM-DDThh:mm:ss)"],
-                        mmol_l=_parse_dexcom_value(row[value_col], unit),
+                        mmol_l=_parse_dexcom_value(row[value_column], unit),
                     )
                 )
             except (ValidationError, ValueError, KeyError):
-                skipped += 1
+                skipped_rows += 1
     else:
         raise ValueError(f"Unrecognised CGM CSV format, columns: {list(columns)}")
 
     if not readings:
         raise ValueError(f"No valid glucose readings in {path}")
-    readings.sort(key=lambda r: r.timestamp)
-    return CGMData(readings=readings, skipped_rows=skipped, source_format=fmt)
+    readings.sort(key=lambda reading: reading.timestamp)
+    return CGMData(readings=readings, skipped_rows=skipped_rows, source_format=source_format)
 
 
 def window(readings: list[GlucoseReading], days: int) -> list[GlucoseReading]:
@@ -109,7 +129,7 @@ def window(readings: list[GlucoseReading], days: int) -> list[GlucoseReading]:
     if not readings:
         return []
     cutoff = readings[-1].timestamp - timedelta(days=days)
-    return [r for r in readings if r.timestamp > cutoff]
+    return [reading for reading in readings if reading.timestamp > cutoff]
 
 
 # --------------------------------------------------------------------------- metrics
@@ -132,7 +152,7 @@ class AverageStats(BaseModel):
     period: Period
     mean_mmol_l: float
     sd_mmol_l: float
-    cv_pct: float = Field(description="Coefficient of variation; <=36% is considered stable.")
+    cv_pct: float = Field(description=f"Coefficient of variation; <={STABLE_CV_PCT}% is considered stable.")
     gmi_pct: float = Field(description="Glucose Management Indicator (estimated HbA1c), in %.")
     gmi_mmol_mol: float = Field(description="Same GMI in IFCC units (mmol/mol).")
     min: ReadingPoint
@@ -179,144 +199,160 @@ class EventReport(BaseModel):
     count: int
     total_minutes: int
     most_common_time_of_day: TimeOfDay | None
-    severe_count: int = Field(description="Events crossing the very-low (<3.0) or very-high (>13.9) level.")
+    severe_count: int = Field(
+        description=f"Events crossing the very-low (<{VERY_LOW}) or very-high (>{VERY_HIGH}) level."
+    )
     events: list[GlucoseEvent]
 
 
-def _r(x: float) -> float:
-    return round(x, 1)
-
-
-def _period(readings: list[GlucoseReading], days: int) -> Period:
-    expected = days * 24 * 60 / READING_INTERVAL_MIN
+def _summarize_period(readings: list[GlucoseReading], days: int) -> Period:
+    expected_readings = days * MINUTES_PER_DAY / READING_INTERVAL_MIN
     return Period(
         days=days,
         start=readings[0].timestamp,
         end=readings[-1].timestamp,
         n_readings=len(readings),
-        coverage_pct=_r(min(100.0, 100 * len(readings) / expected)),
+        coverage_pct=round(min(100.0, 100 * len(readings) / expected_readings), OUTPUT_DECIMALS),
     )
 
 
-def _pct(n: int, total: int) -> float:
-    return _r(100 * n / total) if total else 0.0
+def _percent(count: int, total: int) -> float:
+    return round(100 * count / total, OUTPUT_DECIMALS) if total else 0.0
 
 
-def _require(readings: list[GlucoseReading]) -> None:
+def _require_readings(readings: list[GlucoseReading]) -> None:
     if not readings:
         raise ValueError("No glucose readings in the requested period.")
 
 
 def average(readings: list[GlucoseReading], days: int) -> AverageStats:
-    data = window(readings, days)
-    _require(data)
-    values = [r.mmol_l for r in data]
-    mean = statistics.fmean(values)
-    sd = statistics.pstdev(values)
-    lo = min(data, key=lambda r: r.mmol_l)
-    hi = max(data, key=lambda r: r.mmol_l)
+    recent = window(readings, days)
+    _require_readings(recent)
+    glucose_values = [reading.mmol_l for reading in recent]
+    mean = statistics.fmean(glucose_values)
+    std_dev = statistics.pstdev(glucose_values)
+    lowest = min(recent, key=lambda reading: reading.mmol_l)
+    highest = max(recent, key=lambda reading: reading.mmol_l)
     return AverageStats(
-        period=_period(data, days),
-        mean_mmol_l=_r(mean),
-        sd_mmol_l=_r(sd),
-        cv_pct=_r(100 * sd / mean),
-        # Bergenstal et al. 2018: GMI(%) = 3.38 + 0.02345 * mean glucose (mg/dL).
-        gmi_pct=_r(3.38 + 0.02345 * mean * MGDL_PER_MMOLL),
-        gmi_mmol_mol=_r(12.71 + 4.70587 * mean),
-        min=ReadingPoint(mmol_l=_r(lo.mmol_l), timestamp=lo.timestamp),
-        max=ReadingPoint(mmol_l=_r(hi.mmol_l), timestamp=hi.timestamp),
+        period=_summarize_period(recent, days),
+        mean_mmol_l=round(mean, OUTPUT_DECIMALS),
+        sd_mmol_l=round(std_dev, OUTPUT_DECIMALS),
+        cv_pct=round(100 * std_dev / mean, OUTPUT_DECIMALS),
+        gmi_pct=round(GMI_PCT_INTERCEPT + GMI_PCT_PER_MGDL * mean * MGDL_PER_MMOLL, OUTPUT_DECIMALS),
+        gmi_mmol_mol=round(GMI_MMOL_MOL_INTERCEPT + GMI_MMOL_MOL_PER_MMOLL * mean, OUTPUT_DECIMALS),
+        min=ReadingPoint(mmol_l=round(lowest.mmol_l, OUTPUT_DECIMALS), timestamp=lowest.timestamp),
+        max=ReadingPoint(mmol_l=round(highest.mmol_l, OUTPUT_DECIMALS), timestamp=highest.timestamp),
     )
 
 
-def _in_range(v: float) -> bool:
-    return LOW <= v <= HIGH
+def _is_in_range(mmol_l: float) -> bool:
+    return LOW <= mmol_l <= HIGH
+
+
+def _in_range_percent(glucose_values: list[float]) -> float:
+    return _percent(sum(map(_is_in_range, glucose_values)), len(glucose_values))
 
 
 def time_in_range(readings: list[GlucoseReading], days: int) -> RangeStats:
-    data = window(readings, days)
-    _require(data)
-    values = [r.mmol_l for r in data]
-    n = len(values)
+    recent = window(readings, days)
+    _require_readings(recent)
+    glucose_values = [reading.mmol_l for reading in recent]
+    n_readings = len(glucose_values)
 
-    by_tod: dict[TimeOfDay, list[float]] = {"overnight": [], "morning": [], "afternoon": [], "evening": []}
-    by_day: dict[str, list[float]] = {}
-    for r in data:
-        by_tod[time_of_day(r.timestamp)].append(r.mmol_l)
-        by_day.setdefault(r.timestamp.date().isoformat(), []).append(r.mmol_l)
+    values_by_time_of_day: dict[TimeOfDay, list[float]] = {
+        "overnight": [], "morning": [], "afternoon": [], "evening": []
+    }
+    values_by_date: dict[str, list[float]] = {}
+    for reading in recent:
+        values_by_time_of_day[time_of_day(reading.timestamp)].append(reading.mmol_l)
+        values_by_date.setdefault(reading.timestamp.date().isoformat(), []).append(reading.mmol_l)
 
-    tod_tir = {tod: _pct(sum(map(_in_range, vs)), len(vs)) for tod, vs in by_tod.items() if vs}
-    in_range = sum(map(_in_range, values))
+    in_range_pct_by_time_of_day = {
+        part_of_day: _in_range_percent(values) for part_of_day, values in values_by_time_of_day.items() if values
+    }
+    in_range_count = sum(map(_is_in_range, glucose_values))
     return RangeStats(
-        period=_period(data, days),
+        period=_summarize_period(recent, days),
         overall=RangeBreakdown(
-            very_low_pct=_pct(sum(v < VERY_LOW for v in values), n),
-            low_pct=_pct(sum(VERY_LOW <= v < LOW for v in values), n),
-            in_range_pct=_pct(in_range, n),
-            high_pct=_pct(sum(HIGH < v <= VERY_HIGH for v in values), n),
-            very_high_pct=_pct(sum(v > VERY_HIGH for v in values), n),
+            very_low_pct=_percent(sum(v < VERY_LOW for v in glucose_values), n_readings),
+            low_pct=_percent(sum(VERY_LOW <= v < LOW for v in glucose_values), n_readings),
+            in_range_pct=_percent(in_range_count, n_readings),
+            high_pct=_percent(sum(HIGH < v <= VERY_HIGH for v in glucose_values), n_readings),
+            very_high_pct=_percent(sum(v > VERY_HIGH for v in glucose_values), n_readings),
         ),
-        hours_in_range=_r(in_range * READING_INTERVAL_MIN / 60),
-        in_range_pct_by_time_of_day=tod_tir,
-        best_time_of_day=max(tod_tir, key=tod_tir.__getitem__),
-        worst_time_of_day=min(tod_tir, key=tod_tir.__getitem__),
+        hours_in_range=round(in_range_count * READING_INTERVAL_MIN / MINUTES_PER_HOUR, OUTPUT_DECIMALS),
+        in_range_pct_by_time_of_day=in_range_pct_by_time_of_day,
+        best_time_of_day=max(in_range_pct_by_time_of_day, key=in_range_pct_by_time_of_day.__getitem__),
+        worst_time_of_day=min(in_range_pct_by_time_of_day, key=in_range_pct_by_time_of_day.__getitem__),
         daily=[
-            DailyRange(date=d, in_range_pct=_pct(sum(map(_in_range, vs)), len(vs)), mean_mmol_l=_r(statistics.fmean(vs)))
-            for d, vs in sorted(by_day.items())
+            DailyRange(
+                date=date,
+                in_range_pct=_in_range_percent(day_values),
+                mean_mmol_l=round(statistics.fmean(day_values), OUTPUT_DECIMALS),
+            )
+            for date, day_values in sorted(values_by_date.items())
         ],
     )
 
 
 def find_events(readings: list[GlucoseReading], days: int, kind: Literal["low", "high"]) -> EventReport:
-    """Contiguous runs beyond the threshold lasting >= 15 minutes.
+    """Contiguous runs beyond the threshold lasting >= MIN_EVENT_MINUTES.
 
-    A gap longer than two sample intervals (e.g. sensor dropout) ends an episode.
+    A gap longer than MAX_EVENT_GAP_INTERVALS sample intervals (e.g. sensor dropout) ends an episode.
     """
-    data = window(readings, days)
-    _require(data)
-    threshold = LOW if kind == "low" else HIGH
-    severe = VERY_LOW if kind == "low" else VERY_HIGH
-    beyond = (lambda v: v < threshold) if kind == "low" else (lambda v: v > threshold)
-    max_gap = timedelta(minutes=2 * READING_INTERVAL_MIN)
+    recent = window(readings, days)
+    _require_readings(recent)
+    is_low = kind == "low"
+    threshold = LOW if is_low else HIGH
+    severe_threshold = VERY_LOW if is_low else VERY_HIGH
+
+    def is_beyond_threshold(mmol_l: float) -> bool:
+        return mmol_l < threshold if is_low else mmol_l > threshold
+
+    def is_severe(event: GlucoseEvent) -> bool:
+        return event.extreme_mmol_l < severe_threshold if is_low else event.extreme_mmol_l > severe_threshold
+
+    max_gap = timedelta(minutes=MAX_EVENT_GAP_INTERVALS * READING_INTERVAL_MIN)
 
     runs: list[list[GlucoseReading]] = []
-    current: list[GlucoseReading] = []
-    for r in data:
-        if beyond(r.mmol_l) and (not current or r.timestamp - current[-1].timestamp <= max_gap):
-            current.append(r)
+    current_run: list[GlucoseReading] = []
+    for reading in recent:
+        continues_run = not current_run or reading.timestamp - current_run[-1].timestamp <= max_gap
+        if is_beyond_threshold(reading.mmol_l) and continues_run:
+            current_run.append(reading)
             continue
-        if current:
-            runs.append(current)
-        current = [r] if beyond(r.mmol_l) else []
-    if current:
-        runs.append(current)
+        if current_run:
+            runs.append(current_run)
+        current_run = [reading] if is_beyond_threshold(reading.mmol_l) else []
+    if current_run:
+        runs.append(current_run)
 
     events: list[GlucoseEvent] = []
     for run in runs:
         # A run of k samples spans k intervals of sensor time (each sample represents 5 min).
-        duration = len(run) * READING_INTERVAL_MIN
-        if duration < MIN_EVENT_MINUTES:
+        duration_min = len(run) * READING_INTERVAL_MIN
+        if duration_min < MIN_EVENT_MINUTES:
             continue
-        pick = min if kind == "low" else max
-        extreme = pick(r.mmol_l for r in run)
+        run_values = [reading.mmol_l for reading in run]
+        extreme = min(run_values) if is_low else max(run_values)
         events.append(
             GlucoseEvent(
                 start=run[0].timestamp,
                 end=run[-1].timestamp,
-                duration_min=duration,
-                extreme_mmol_l=_r(extreme),
+                duration_min=duration_min,
+                extreme_mmol_l=round(extreme, OUTPUT_DECIMALS),
                 time_of_day=time_of_day(run[0].timestamp),
             )
         )
 
-    tods = Counter(e.time_of_day for e in events)
-    is_severe = (lambda e: e.extreme_mmol_l < severe) if kind == "low" else (lambda e: e.extreme_mmol_l > severe)
+    events_by_time_of_day = Counter(event.time_of_day for event in events)
     return EventReport(
-        period=_period(data, days),
+        period=_summarize_period(recent, days),
         kind=kind,
         threshold_mmol_l=threshold,
         count=len(events),
-        total_minutes=sum(e.duration_min for e in events),
-        most_common_time_of_day=tods.most_common(1)[0][0] if tods else None,
+        total_minutes=sum(event.duration_min for event in events),
+        most_common_time_of_day=events_by_time_of_day.most_common(1)[0][0] if events_by_time_of_day else None,
         severe_count=sum(map(is_severe, events)),
         events=events,
     )

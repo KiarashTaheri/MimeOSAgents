@@ -27,9 +27,17 @@ def test_average_and_gmi():
     stats = cgm.average(series([7.0] * 12), days=1)
     assert stats.mean_mmol_l == 7.0
     assert stats.cv_pct == 0.0
-    # GMI(%) = 3.38 + 0.02345 * 126.1 mg/dL = 6.3 ; IFCC = 12.71 + 4.70587 * 7 = 45.7
+    # GMI(%) = 3.31 + 0.02392 * 126.1 mg/dL = 6.3 ; IFCC = 12.71 + 4.70587 * 7 = 45.7
     assert stats.gmi_pct == 6.3
     assert stats.gmi_mmol_mol == 45.7
+
+
+def test_gmi_matches_bergenstal_at_high_mean():
+    # At 15 mmol/L (270.3 mg/dL): 3.31 + 0.02392 * 270.3 = 9.8%. Wrong coefficients drift visibly here.
+    stats = cgm.average(series([15.0] * 12), days=1)
+    assert stats.gmi_pct == 9.8
+    # The % and IFCC values describe the same estimate: NGSP% = IFCC / 10.929 + 2.15.
+    assert abs(stats.gmi_mmol_mol / 10.929 + 2.15 - stats.gmi_pct) < 0.1
 
 
 def test_window_is_anchored_to_latest_reading():
