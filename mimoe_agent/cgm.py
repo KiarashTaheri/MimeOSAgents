@@ -32,7 +32,7 @@ MIN_VALID_MMOL_L, MAX_VALID_MMOL_L = 1.1, 33.3
 SENSOR_LOW_MMOL_L, SENSOR_HIGH_MMOL_L = 2.2, 22.2
 
 # Glucose Management Indicator (Bergenstal et al. 2018).
-GMI_PCT_INTERCEPT, GMI_PCT_PER_MGDL = 3.38, 0.02345  # GMI(%) from mean glucose in mg/dL
+GMI_PCT_INTERCEPT, GMI_PCT_PER_MGDL = 3.31, 0.02392  # GMI(%) from mean glucose in mg/dL
 GMI_MMOL_MOL_INTERCEPT, GMI_MMOL_MOL_PER_MMOLL = 12.71, 4.70587  # GMI(mmol/mol) from mean in mmol/L
 
 # Time-of-day buckets: overnight 00-06, morning 06-12, afternoon 12-18, evening 18-24.
