@@ -18,6 +18,9 @@ from mimoe_agent.config import get_settings
 
 pytestmark = pytest.mark.live
 
+# Port 9 (discard) has nothing listening, so connecting fails immediately: a real "mimOE is down".
+CLOSED_PORT_URL = "http://127.0.0.1:9/mimik-ai/openai/v1"
+
 
 def mimoe_reachable() -> bool:
     settings = get_settings()
@@ -76,7 +79,7 @@ def test_chat_answers_with_tools_and_keeps_session():
 
 
 def test_mimoe_down_returns_503(settings_env):
-    settings_env(MIMOE_BASE_URL="http://127.0.0.1:9/mimik-ai/openai/v1", MIMOE_MAX_RETRIES="0", MIMOE_TIMEOUT_S="3")
+    settings_env(MIMOE_BASE_URL=CLOSED_PORT_URL, MIMOE_MAX_RETRIES="0", MIMOE_TIMEOUT_S="3")
     with TestClient(api.app) as client:
         chat = client.post("/chat", json={"message": "How are my lows?"})
         health = client.get("/health").json()
@@ -86,6 +89,6 @@ def test_mimoe_down_returns_503(settings_env):
 
 
 def test_empty_message_is_rejected(settings_env):
-    settings_env(MIMOE_BASE_URL="http://127.0.0.1:9/mimik-ai/openai/v1")
+    settings_env(MIMOE_BASE_URL=CLOSED_PORT_URL)
     with TestClient(api.app) as client:
         assert client.post("/chat", json={"message": ""}).status_code == 422

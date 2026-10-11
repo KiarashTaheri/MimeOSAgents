@@ -15,8 +15,11 @@ from .agent import AgentError, CGMAssistant, MimoeUnavailableError, ToolCallReco
 from .observability import setup_observability
 
 
+MAX_MESSAGE_CHARS = 2000  # keeps one question well inside the model's ~12k-token context
+
+
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=2000, examples=["When am I usually in range?"])
+    message: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS, examples=["When am I usually in range?"])
     session_id: str | None = Field(default=None, description="Reuse to continue a conversation.")
 
 
@@ -48,7 +51,7 @@ app = FastAPI(title="mimOE CGM Agent", version="0.1.0", lifespan=lifespan)
 logfire.instrument_fastapi(app)
 
 
-def _assistant(request: Request) -> CGMAssistant:
+def _get_assistant(request: Request) -> CGMAssistant:
     return request.app.state.assistant
 
 
@@ -58,7 +61,7 @@ async def chat(body: ChatRequest, request: Request) -> ChatResponse:
     session_id = body.session_id or uuid.uuid4().hex
     session = sessions.setdefault(session_id, SQLiteSession(session_id))
     try:
-        result = await _assistant(request).ask(body.message, session=session)
+        result = await _get_assistant(request).ask(body.message, session=session)
     except MimoeUnavailableError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     except AgentError as e:
@@ -75,10 +78,10 @@ async def reset_session(session_id: str, request: Request) -> None:
 
 @app.get("/health", response_model=HealthResponse)
 async def health(request: Request) -> HealthResponse:
-    assistant = _assistant(request)
-    readings = len(assistant.context.readings)
+    assistant = _get_assistant(request)
+    reading_count = len(assistant.context.readings)
     try:
         agent = await assistant.agent()
     except MimoeUnavailableError as e:
-        return HealthResponse(status="degraded", mimoe_reachable=False, model=None, cgm_readings=readings, detail=str(e))
-    return HealthResponse(status="ok", mimoe_reachable=True, model=str(agent.model.model), cgm_readings=readings)
+        return HealthResponse(status="degraded", mimoe_reachable=False, model=None, cgm_readings=reading_count, detail=str(e))
+    return HealthResponse(status="ok", mimoe_reachable=True, model=str(agent.model.model), cgm_readings=reading_count)

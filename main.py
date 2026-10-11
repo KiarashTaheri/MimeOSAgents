@@ -15,7 +15,7 @@ from mimoe_agent.agent import AgentError, AgentResult, CGMAssistant
 from mimoe_agent.observability import setup_observability
 
 
-def show(result: AgentResult, verbose: bool) -> None:
+def print_result(result: AgentResult, verbose: bool) -> None:
     if verbose:
         for call in result.tool_calls:
             print(f"  ↳ {call.name}({call.args}){'' if call.ok else '  [error]'}")
@@ -41,7 +41,7 @@ async def main() -> int:
 
     if args.question:
         try:
-            show(await assistant.ask(" ".join(args.question), session), args.verbose)
+            print_result(await assistant.ask(" ".join(args.question), session), args.verbose)
         except AgentError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
@@ -57,7 +57,7 @@ async def main() -> int:
         if not question:
             continue
         try:
-            show(await assistant.ask(question, session), args.verbose)
+            print_result(await assistant.ask(question, session), args.verbose)
         except AgentError as e:
             print(f"Error: {e}\n", file=sys.stderr)
 
