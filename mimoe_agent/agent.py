@@ -88,7 +88,7 @@ def create_client(settings: Settings) -> AsyncOpenAI:
     timeouts, 408/409/429 and 5xx with exponential backoff and jitter, up to `max_retries` times."""
     return AsyncOpenAI(
         base_url=settings.base_url,
-        api_key=settings.api_key,
+        api_key=settings.api_key.get_secret_value(),
         max_retries=settings.max_retries,
         timeout=settings.timeout_s,
     )

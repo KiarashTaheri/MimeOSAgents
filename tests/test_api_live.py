@@ -12,6 +12,7 @@ import json
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from mimoe_agent import api
 from mimoe_agent.config import get_settings
@@ -23,9 +24,13 @@ CLOSED_PORT_URL = "http://127.0.0.1:9/mimik-ai/openai/v1"
 
 
 def mimoe_reachable() -> bool:
-    settings = get_settings()
     try:
-        httpx.get(f"{settings.base_url}/models", headers={"Authorization": f"Bearer {settings.api_key}"}, timeout=3)
+        settings = get_settings()
+    except ValidationError:  # no .env (e.g. a fresh clone): skip live tests instead of breaking collection
+        return False
+    headers = {"Authorization": f"Bearer {settings.api_key.get_secret_value()}"}
+    try:
+        httpx.get(f"{settings.base_url}/models", headers=headers, timeout=3)
     except httpx.HTTPError:
         return False
     return True
