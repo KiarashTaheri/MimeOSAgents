@@ -18,6 +18,7 @@ import argparse
 import asyncio
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -146,7 +147,7 @@ def status_icon(ok: bool) -> str:
     return "✅" if ok else "❌"
 
 
-async def main() -> None:
+async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("-k", default="", help="Only run cases whose id contains this string.")
     args = parser.parse_args()
@@ -155,7 +156,11 @@ async def main() -> None:
     cases = [Case.model_validate_json(line) for line in (HERE / "testset.jsonl").read_text().splitlines() if line.strip()]
     cases = [case for case in cases if args.k in case.id]
     assistant = CGMAssistant()
-    model = str((await assistant.agent()).model.model)
+    try:
+        model = str((await assistant.agent()).model.model)
+    except AgentError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
     results: list[CaseResult] = []
     with logfire.span("eval.run", model=model, n_cases=len(cases)) as run_span:
@@ -183,6 +188,8 @@ async def main() -> None:
             print(f"\n--- {result.id} (expected {result.expected_values}, tools {result.tools_called})\n"
                   f"{result.answer or result.error}")
 
+    return 0
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))
