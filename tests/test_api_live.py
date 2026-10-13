@@ -14,9 +14,17 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from mimoe_agent import api
-from mimoe_agent.agent import build_agent
 from mimoe_agent.config import get_settings
+
+# The API module reads settings on import, and MIMOE_API_KEY is required. Without a .env (e.g. a fresh
+# clone), skip these tests instead of failing collection; the offline tests still run.
+try:
+    get_settings()
+except ValidationError:
+    pytest.skip("no .env with MIMOE_API_KEY: copy .env.example to .env", allow_module_level=True)
+
+from mimoe_agent import api  # noqa: E402
+from mimoe_agent.agent import build_agent  # noqa: E402
 
 pytestmark = pytest.mark.live
 
@@ -25,10 +33,7 @@ CLOSED_PORT_URL = "http://127.0.0.1:9/mimik-ai/openai/v1"
 
 
 def mimoe_reachable() -> bool:
-    try:
-        settings = get_settings()
-    except ValidationError:  # no .env (e.g. a fresh clone): skip live tests instead of breaking collection
-        return False
+    settings = get_settings()
     headers = {"Authorization": f"Bearer {settings.api_key.get_secret_value()}"}
     try:
         httpx.get(f"{settings.base_url}/models", headers=headers, timeout=3)
