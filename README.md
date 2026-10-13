@@ -70,6 +70,20 @@ def get_low_events(ctx: RunContextWrapper[CGMContext], days: Days) -> cgm.EventR
     """Low glucose episodes (below 3.9 mmol/L for at least 15 minutes): ..."""
 ```
 
+## Safety
+
+The agent explains data; it never gives medical advice. Three deterministic checks in `safety.py` sit around the model, so they behave the same on any model and can't be talked out of:
+
+| Check | When | What happens |
+|---|---|---|
+| **Question guardrail** | Before the model | Dosing, medication, diagnosis, symptom and prompt-injection requests get a fixed reply that points to a doctor or care team. The model is never called. |
+| **Answer guardrail** | After the model | An answer containing a dose, a treatment instruction, a drug name or a diagnosis is replaced with a safe reply. Referrals ("ask your doctor about…") are allowed. |
+| **Range alerts** | Every answer | A latest reading below 3.9 or above 13.9 mmol/L adds an urgent note to contact a professional (or emergency services if very unwell). 14-day numbers outside the consensus targets add a note to review them with a healthcare provider. |
+
+Symptom questions ("I feel shaky and sweaty") are checked first and mention emergency services. The rules are conservative on purpose: a harmless question may get a referral instead of an answer, but a dosing question never reaches the model.
+
+The API returns this as structured data alongside the text: `blocked` names the guardrail that answered, and `alerts` lists each note with a level (`urgent` or `advisory`).
+
 ## Design choices
 
 | Choice | Why |
@@ -109,12 +123,13 @@ Time windows count back from the latest reading, so "this week" means the last 7
 
 ## Evaluation
 
-`evals/testset.jsonl` has 11 cases, each run against the live agent. Each case checks:
+`evals/testset.jsonl` has 17 cases: the 11 original cases plus 6 safety cases (dosing under pressure, medication, diagnosis, symptoms, prompt injection, indirect advice). Each case checks:
 
 - **tools:** the right tools were called;
 - **days:** the window matched the wording;
 - **numbers:** the expected values, computed live from `cgm.py`, appear in the answer;
-- **text:** key words appear (e.g. a referral for dosing questions).
+- **text:** key words appear (e.g. a referral for dosing questions);
+- **safe:** the answer contains no medical advice, and the expected guardrail answered.
 
 ```
 ✅ avg_week   ✅ avg_24h     ✅ gmi_2w      ✅ tir_week        ✅ worst_time      ✅ lows_3d
@@ -122,12 +137,14 @@ Time windows count back from the latest reading, so "this week" means the last 7
 Pass rate: 11/11   Median latency: 11 s
 ```
 
+That run predates the safety cases. The 6 cases answered by a guardrail pass without the model; a full 17-case run is next.
+
 The first run scored 10/11: the model reported GMI in mmol/mol instead of %. One prompt rule fixed it.
 
 ## Tests
 
 ```bash
-uv run pytest -m "not live"   # metric maths, CSV parsing, tool validation
+uv run pytest -m "not live"   # metric maths, CSV parsing, tool validation, safety guardrails
 uv run pytest                 # + live tests against real mimOE (skipped if unreachable)
 ```
 
@@ -143,9 +160,9 @@ To use your own data, set `MIMOE_CGM_PATH`. The loader supports a simple `timest
 
 - **Model size:** tiny models (e.g. SmolLM2) don't emit reliable tool calls. They would need a text-parsing fallback.
 - **Latency:** 5–17 s per question. Streaming and smaller tool outputs would help.
-- **Evals:** one run of 11 cases. Repeated runs and harder cases are next.
+- **Evals:** single runs of a small set. Repeated runs and more adversarial cases are next.
 - **Metric simplifications:** "yesterday" means the last 24 hours, an episode ends at the first in-range reading, and timestamps have no timezone.
-- **Safety:** dosing refusals rely on the prompt, not on dedicated guardrails.
+- **Safety rules are keyword-based.** They are tested against paraphrases and look-alike characters, but a determined rewording can still slip past the question check. The answer check is the second line of defence. A small on-device classifier would be the next step.
 - **Single user:** in-memory sessions and no API auth. `/health` stops checking mimOE once a model has been resolved.
 - **Privacy:** with a Logfire token, traces (including glucose values) go to Logfire's cloud. Real data would need a local collector.
 
@@ -156,6 +173,7 @@ mimoe_agent/
   config.py         settings from .env
   cgm.py            data loading and glucose metrics
   tools.py          tools the model can call
+  safety.py         guardrails and out-of-range alerts
   agent.py          mimOE client, agent, error handling
   api.py            FastAPI endpoints
   observability.py  Logfire setup
