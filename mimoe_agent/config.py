@@ -14,8 +14,9 @@ class Settings(BaseSettings):
 
     # mimOE exposes an OpenAI-compatible API; this is the only coupling point to the runtime.
     base_url: str = "http://localhost:8083/mimik-ai/openai/v1"
-    # mimOE does not validate the key, but the OpenAI client requires one.
-    api_key: str = "1234"
+    # Required, from MIMOE_API_KEY in .env or the environment. Never hard-coded: mimOE doesn't check it today,
+    # but a deployment that does must not have its key in source control.
+    api_key: SecretStr
     # None -> use whichever model is currently loaded in mimOE Studio.
     model: str | None = None
 

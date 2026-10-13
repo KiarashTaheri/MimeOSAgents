@@ -20,6 +20,8 @@ def print_result(result: AgentResult, verbose: bool) -> None:
         for call in result.tool_calls:
             print(f"  ↳ {call.name}({call.args}){'' if call.ok else '  [error]'}")
         print(f"  ({result.model}, {result.latency_ms} ms)")
+        if result.blocked:
+            print(f"  [guardrail: {result.blocked}]")
     print(f"\n{result.answer}\n")
 
 

@@ -1,177 +1,189 @@
 # mimOE CGM Agent
 
-This is a small AI agent that answers questions about your continuous glucose monitor (CGM) data. It runs entirely on your own machine: the model is served locally by **mimOE**, and the agent connects to it through mimOE's OpenAI-compatible endpoint (the "Bring Your Own Framework" path).
+An AI agent that answers questions about continuous glucose monitor (CGM) data, running entirely on-device. **mimOE** serves the model locally through an OpenAI-compatible endpoint, and the agent plugs into it with a standard framework (the "Bring Your Own Framework" path).
 
 ```
 $ uv run python main.py -v "Give me a quick summary of this week: average glucose, time in range and lows."
   ↳ get_average_glucose({"days": 7})
   ↳ get_time_in_range({"days": 7})
   ↳ get_low_events({"days": 7})
-  (qwen3-4b, 16486 ms)
+  (qwen3-4b, 17427 ms)
 
-This week, your average glucose was 6.9 mmol/L with a variability of 1.5 mmol/L. You spent 95.2% of the
-time in the target range (3.9-10.0 mmol/L), with the best in-range period in the morning and worst in the
-evening. You had 4 low glucose episodes, mostly overnight, with the longest lasting 90 minutes.
+This week, your average glucose was 7.8 mmol/L with a variability of 2.7 mmol/L. You spent 72.4% of the
+time in the target range (3.9-10.0 mmol/L), with the best in-range time during overnight hours. You had
+5 low glucose episodes, including a 335-minute event that dropped below 3.0 mmol/L.
 ```
 
-The three tools in that example were called **in parallel, in a single model step**. Every number in the answer was computed by deterministic Python code, not by the LLM.
+The model picked three tools and called them in parallel. Every number came from deterministic, unit-tested Python; the model did no arithmetic.
 
-> ⚠️ This is a wellness demo on synthetic data, not a medical device, and it doesn't give medical advice.
+> ⚠️ A wellness demo on synthetic data. Not a medical device, and it doesn't give medical advice.
 
----
+## Quick start
 
-## How the components connect
+Needs Python 3.11+, [uv](https://docs.astral.sh/uv/) and mimOE Studio with a model loaded (tested with qwen3-4b).
+
+```bash
+uv sync
+cp .env.example .env     # set MIMOE_BASE_URL and MIMOE_API_KEY
+```
+
+| Command | What it does |
+|---|---|
+| `uv run python main.py` | Interactive chat (`-v` shows tool calls) |
+| `uv run python main.py "When am I in range?"` | Ask one question |
+| `uv run uvicorn mimoe_agent.api:app` | HTTP API, docs at `localhost:8000/docs` |
+| `uv run python evals/run_evals.py` | Run the eval set |
+| `uv run pytest -m "not live"` | Offline tests |
+
+All settings live in `.env` (git-ignored). `MIMOE_API_KEY` is required. Add `LOGFIRE_TOKEN` to enable tracing.
+
+## How it works
 
 ```mermaid
 flowchart LR
-    U[User] -->|CLI / HTTP| API["FastAPI<br/>(api.py) or CLI (main.py)"]
-    API --> R["OpenAI Agents SDK<br/>Runner + Agent (agent.py)"]
-    R -->|"chat.completions + tools<br/>(OpenAI wire protocol)"| M["mimOE<br/>localhost:8083/mimik-ai/openai/v1"]
-    M --> L["Local LLM<br/>(qwen3-4b / SmolLM2 …)"]
-    M -->|tool_calls| R
-    R -->|"validated args (pydantic)"| T["CGM tools (tools.py)"]
-    T --> C["Deterministic metrics (cgm.py)"]
-    C --> D[("CGM CSV<br/>mmol/L")]
-    T -->|JSON results| R
-    R -. spans .-> LF["Pydantic Logfire"]
+    U[User] -->|CLI / HTTP| A["Agent<br/>(OpenAI Agents SDK)"]
+    A <-->|"chat completions + tool calls"| M["mimOE<br/>qwen3-4b"]
+    A -->|"validated args"| T["Tools"]
+    T --> C["Metrics (cgm.py)"]
+    C --> D[("CGM CSV")]
 ```
 
-1. **mimOE is the inference engine.** mimOE Studio loads a model and exposes it at an OpenAI-compatible endpoint (`/models`, `/chat/completions`, with native tool calling). Inference happens on the device.
-2. **The agent framework talks to mimOE like it would to OpenAI.** The only coupling is one object:
-   ```python
-   client = AsyncOpenAI(base_url="http://localhost:8083/mimik-ai/openai/v1", api_key="1234")
-   model  = OpenAIChatCompletionsModel(model="qwen3-4b", openai_client=client)
-   ```
-   That's the whole "BYO Framework" contract. Swapping in LangChain (`ChatOpenAI(base_url=…)`) or LlamaIndex (`OpenAILike(api_base=…)`) would leave the mimOE side unchanged.
-3. **The agent loop** (run by the Agents SDK `Runner`):
-   1. Send the conversation and tool schemas to mimOE.
-   2. The model replies with `tool_calls`.
-   3. Validate the arguments and run the tools concurrently.
-   4. Send the results back.
-   5. The model writes the final answer.
-4. **Tools are deterministic.** The LLM chooses which tool to call and explains the result. It never does arithmetic. Time in range, GMI and event detection are computed in `cgm.py` and unit-tested.
-5. **Data stays local.** The CGM file, the model and the tool execution all live on the device. That's the pitch of on-device health agents: personal data never leaves the device.
+1. The agent sends the question and four tool schemas to mimOE.
+2. The model replies with a tool call, e.g. `get_low_events({"days": 7})`.
+3. The arguments are validated and the tool computes the numbers in Python.
+4. The result goes back to the model, which writes the answer.
 
-Agent graph, rendered with `agents.extensions.visualization.draw_graph` (`uv run python scripts/draw_agent_graph.py`):
+The only coupling to mimOE is one client object, so swapping the framework changes nothing on the mimOE side:
 
-![Agent graph](docs/agent_graph.png)
+```python
+client = AsyncOpenAI(base_url=settings.base_url, api_key=settings.api_key.get_secret_value())
+model = OpenAIChatCompletionsModel(model="qwen3-4b", openai_client=client)
+```
 
-## Framework and tooling choices
+Each tool's schema is generated from its signature and docstring, and the same type validates what the model sends back:
+
+```python
+Days = Annotated[int, Field(ge=MIN_DAYS, le=MAX_DAYS, description="How many days back to look ...")]
+
+@function_tool(failure_error_function=tool_error_message)
+def get_low_events(ctx: RunContextWrapper[CGMContext], days: Days) -> cgm.EventReport:
+    """Low glucose episodes (below 3.9 mmol/L for at least 15 minutes): ..."""
+```
+
+## Safety
+
+The agent explains data; it never gives medical advice. Three deterministic checks in `safety.py` sit around the model, so they behave the same on any model and can't be talked out of:
+
+| Check | When | What happens |
+|---|---|---|
+| **Question guardrail** | Before the model | Dosing, medication, diagnosis, symptom and prompt-injection requests get a fixed reply that points to a doctor or care team. The model is never called. |
+| **Answer guardrail** | After the model | An answer containing a dose, a treatment instruction, a drug name or a diagnosis is replaced with a safe reply. Referrals ("ask your doctor about…") are allowed. |
+| **Range alerts** | Every answer | A latest reading below 3.9 or above 13.9 mmol/L adds an urgent note to contact a professional (or emergency services if very unwell). 14-day numbers outside the consensus targets add a note to review them with a healthcare provider. |
+
+Symptom questions ("I feel shaky and sweaty") are checked first and mention emergency services. The rules are conservative on purpose: a harmless question may get a referral instead of an answer, but a dosing question never reaches the model.
+
+The API returns this as structured data alongside the text: `blocked` names the guardrail that answered, and `alerts` lists each note with a level (`urgent` or `advisory`).
+
+## Design choices
 
 | Choice | Why |
 |---|---|
-| **mimOE** (qwen3-4b) | The point of the exercise: local, private inference behind a standard API. qwen3-4b handles native tool calling reliably at about 35 tok/s on this hardware. |
-| **OpenAI Agents SDK** | It's a thin layer over chat completions, so it fits an OpenAI-compatible endpoint naturally. It provides parallel tool execution, sessions (conversation memory), `@function_tool` (schemas from type hints), `draw_graph`, and a tracing hook that Logfire instruments. It hides less than LangChain and still saves writing the tool loop by hand. |
-| **Pydantic** | Tool arguments are validated from function signatures (`days: Annotated[int, Field(ge=1, le=14)]`), so the schema the model sees and the validation of its output come from the same definition. All metric outputs, API bodies and settings are pydantic models too. |
-| **FastAPI** | Exposes the agent as a service (`/chat`, `/health`) with typed request and response models and Swagger docs at `/docs`. |
-| **Pydantic Logfire** | Traces every request: FastAPI → `agent.run` → model calls on mimOE → each tool. Each run records `success`, `tool_errors`, `tools_used` and `latency_ms`, so success rate and latency can be queried and charted. The Agents SDK's default exporter (to OpenAI's platform) is turned off, so nothing leaves the machine except to Logfire, and only when a token is configured. |
-| **mmol/L** | All glucose values, thresholds (3.9–10.0 target range, <3.0 / >13.9 severe) and outputs use mmol/L, following the International Consensus on Time in Range. Dexcom mg/dL exports are converted on load. |
+| **mimOE + qwen3-4b** | Private, on-device inference behind a standard API. Reliable native tool calling at ~35 tokens/s. |
+| **OpenAI Agents SDK** | A thin layer over chat completions. Provides the tool loop, parallel calls, sessions and tracing hooks. |
+| **Deterministic tools** | The model chooses tools and explains results. All math lives in `cgm.py`. |
+| **Pydantic** | One type defines each tool's schema and validates the model's arguments. Settings and API bodies are typed too. |
+| **FastAPI** | `/chat` with sessions, `/health`, typed responses. |
+| **Logfire** (optional) | Traces each request, model call and tool, with success and latency per run. |
+| **mmol/L** | International Consensus thresholds. Dexcom mg/dL exports are converted on load. |
 
-### Things I verified about the mimOE endpoint (and handled)
-- **Native tool calling works in both directions**, including several `tool_calls` in a single response, which makes parallel execution possible.
-- **Qwen3 returns reasoning inside `content`** as `<think>…</think>` rather than in a separate field. The agent strips it (`strip_think`, unit-tested).
-- **`/no_think` turns reasoning off** (a Qwen3 soft switch). It's appended to the instructions by default and cuts latency a lot. Set `MIMOE_THINKING=true` to turn reasoning back on.
-- **`/responses` returns 404.** mimOE only implements chat completions, so the agent uses `OpenAIChatCompletionsModel`, not the Responses model.
-- **The API key isn't checked**, but the OpenAI client needs one, so any value works.
-- **Model auto-detection:** if `MIMOE_MODEL` isn't set, the agent uses whatever model is loaded in mimOE Studio (`GET /models`).
+**mimOE specifics:** tool calling works, including several calls in one reply. Qwen3's `<think>` reasoning arrives inside the answer and is stripped. `/no_think` is added by default to cut latency. `/responses` isn't supported, so the agent uses chat completions. If `MIMOE_MODEL` is unset, the loaded model is used.
 
-### Reliability: retries and error handling
-- **Retries:** the OpenAI client retries connection errors, timeouts, 408/409/429 and 5xx with exponential backoff and jitter (`MIMOE_MAX_RETRIES`, default 3).
-- **Bad tool arguments:** for example `days: 40` or invalid JSON. The real validation error goes back to the model (`Tool error: days: Input should be less than or equal to 14 …`) so it can correct itself, rather than crashing the run. For privacy, the Agents SDK strips argument details from these errors by default (`OPENAI_AGENTS_DONT_LOG_TOOL_DATA`). I kept that default for health data and re-check the arguments in `tool_error_message` to recover the reason.
-- **Empty responses:** small models sometimes return only an empty `<think>` block. The agent nudges the model once, then fails cleanly.
-- **mimOE unreachable / model not loaded:** returns a clear message ("Is mimOE Studio running with a model loaded?"). The API maps this to **503**, other model failures (turn limit, bad output) to **502**, and invalid input to **422**. `/health` reports `degraded` instead of crashing, and the API starts even when mimOE is down because the model is resolved lazily.
-- **Bounded context:** event lists are capped at the 10 most recent so tool output fits comfortably in the 12k context.
+## Reliability
 
-### Considered but not used
-- **OpenAI tool search** (`tool_search`, `defer_loading`): this is a Responses API feature, and mimOE doesn't expose `/responses`. With only 4 tools, eager loading is also the better trade-off, as OpenAI's own guidance says. It becomes worth it once there are dozens of tools across domains (glucose, sleep, HRV, labs); I'd then group them into namespaces and implement client-side search over chat completions.
-- **A multi-agent setup** (triage + specialists): not needed at this size. Every extra hop costs about 5–10 s on a 4B local model.
+| Situation | Behaviour |
+|---|---|
+| mimOE briefly unavailable | Retries with exponential backoff (3 by default) |
+| mimOE down or no model loaded | Clear message; API returns **503**, `/health` reports `degraded` |
+| Bad tool arguments (`days: 40`) | The reason goes back to the model so it can correct itself |
+| Empty model reply | One nudge, then a clean error (**502**) |
+| Invalid request | **422** |
+
+## Glucose metrics
+
+Thresholds follow the International Consensus on Time in Range (Battelino et al., 2019).
+
+| Metric | Definition |
+|---|---|
+| Time in range | Share of readings in 3.9–10.0 mmol/L, plus below 3.0, 3.0–3.9, 10.0–13.9 and above 13.9 |
+| Variability | SD and CV (SD ÷ mean); CV ≤ 36% is stable |
+| GMI | Estimated A1c: 3.31 + 0.02392 × mean mg/dL (Bergenstal et al., 2018) |
+| Episodes | ≥ 15 min below 3.9 or above 10.0; a sensor gap over 10 min ends one |
+
+Time windows count back from the latest reading, so "this week" means the last 7 days of data.
 
 ## Evaluation
 
-`evals/testset.jsonl` has 11 cases. `evals/run_evals.py` runs each one against the live agent on mimOE in a fresh session and scores it on four checks:
-- **tools:** the right tools were called, or none for small talk and dosing questions.
-- **days:** the right time window was picked from the wording ("last 24 hours" → 1, "this week" → 7, "past two weeks" → 14).
-- **numbers:** each expected value appears in the answer. Expected values are computed live from `cgm.py`, so ground truth always matches the data.
-- **text:** expected words appear, e.g. "evening" for the worst time of day, or a referral to a healthcare provider for dosing.
+`evals/testset.jsonl` has 17 cases: the 11 original cases plus 6 safety cases (dosing under pressure, medication, diagnosis, symptoms, prompt injection, indirect advice). Each case checks:
 
-Latest run (qwen3-4b on mimOE):
+- **tools:** the right tools were called;
+- **days:** the window matched the wording;
+- **numbers:** the expected values, computed live from `cgm.py`, appear in the answer;
+- **text:** key words appear (e.g. a referral for dosing questions);
+- **safe:** the answer contains no medical advice, and the expected guardrail answered.
 
 ```
-✅ avg_week         ✅ avg_24h          ✅ gmi_2w           ✅ tir_week
-✅ worst_time       ✅ lows_3d          ✅ lows_when        ✅ highs_week
-✅ weekly_summary   ✅ dosing_refusal   ✅ small_talk
-Pass rate: 11/11 (100%)   Median latency: ~11-13 s
+✅ avg_week   ✅ avg_24h     ✅ gmi_2w      ✅ tir_week        ✅ worst_time      ✅ lows_3d
+✅ lows_when  ✅ highs_week  ✅ weekly_summary  ✅ dosing_refusal  ✅ small_talk
+Pass rate: 11/11   Median latency: 11 s
 ```
 
-**What the evals caught:** the first run scored 10/11. Asked for "estimated A1c (GMI)", the model answered **45.1 mmol/mol**. That's correct, but it's the IFCC unit, not the more familiar **6.3%**. A one-line instruction fixed it. Evals also caught a bug of mine early on: I'd applied the mmol/mol GMI formula and labelled the result as a percentage.
+That run predates the safety cases. The 6 cases answered by a guardrail pass without the model; a full 17-case run is next.
 
-Each case is also a Logfire span (`eval.case`) with `passed` and the sub-scores, so pass rate can be tracked over model, prompt or data changes.
+The first run scored 10/11: the model reported GMI in mmol/mol instead of %. One prompt rule fixed it.
 
 ## Tests
 
 ```bash
-uv run pytest -m "not live"   # fast offline tests: metric maths, Dexcom parsing, tool validation, <think> stripping
-uv run pytest                 # + live API tests: FastAPI -> agent -> real mimOE (skipped if mimOE is unreachable)
+uv run pytest -m "not live"   # metric maths, CSV parsing, tool validation, safety guardrails
+uv run pytest                 # + live tests against real mimOE (skipped if unreachable)
 ```
 
-The live tests don't use fakes. They check `/health`, a `/chat` turn that must call `get_time_in_range`, and a follow-up ("And what about over two weeks?") that only works if session memory carries the context through, so it must call the tool with `days=14`. They also check the real 503 behaviour by pointing the app at a closed port.
+The live tests use no mocks. They include a follow-up question that only passes if session memory works, and a check that a down mimOE returns 503.
 
-## Setup
+## Data
 
-Requirements: Python 3.11+, [uv](https://docs.astral.sh/uv/), and mimOE Studio with a model loaded (I tested with qwen3-4b). Graphviz is needed only for the graph image.
+`data/cgm_mock.csv` holds 14 days of synthetic readings at 5-minute intervals, in mmol/L. Over the last 7 days: mean 7.8 mmol/L, 72.4% in range, evenings as the weakest time of day, 5 low episodes (two below 3.0) and a 2-hour sensor gap.
 
-```bash
-uv sync
-cp .env.example .env          # set MIMOE_BASE_URL (mimOE Studio → Model view → API) and, optionally, LOGFIRE_TOKEN
-```
-
-Run it:
-
-```bash
-uv run python main.py                                  # interactive chat (add -v to see tool calls)
-uv run python main.py "When am I usually in range?"    # one question
-
-uv run uvicorn mimoe_agent.api:app --reload            # API, Swagger UI at http://127.0.0.1:8000/docs
-curl -s localhost:8000/health
-curl -s localhost:8000/chat -H 'content-type: application/json' -d '{"message": "How many lows did I have this week?"}'
-
-uv run python evals/run_evals.py                       # eval set (prints pass rate, writes evals/results.json)
-uv run python scripts/draw_agent_graph.py              # regenerate docs/agent_graph.png
-```
-
-**Logfire:** put a write token in `.env` as `LOGFIRE_TOKEN` (git-ignored). Without one, everything runs normally and no traces are exported.
-
-### Using your own CGM data
-`MIMOE_CGM_PATH=/path/to/export.csv`. Two formats are supported:
-- a simple `timestamp,glucose_mmol_l` CSV (this is what `scripts/make_mock_cgm.py` generates)
-- a **Dexcom Clarity** export, in either mmol/L or mg/dL (mg/dL is converted). `Low`/`High` sensor values map to 2.2/22.2 mmol/L, and non-reading rows are ignored.
-
-Invalid or out-of-range rows are skipped and counted, not fatal. Time windows are anchored to the latest reading, not the wall clock, so "this week" means the last 7 days of data.
-
-The mock data (14 days, 5-min readings, seeded) has patterns built in for the agent to find: late carb-heavy dinners causing evening highs (one above 13.9), overnight lows (one below 3.0), a dawn rise, and a 2-hour sensor gap.
+To use your own data, set `MIMOE_CGM_PATH`. The loader supports a simple `timestamp,glucose_mmol_l` CSV and Dexcom Clarity exports (mmol/L or mg/dL). Bad rows are skipped and counted.
 
 ## Limitations
-- **Model size matters for tool calling.** qwen3-4b passes all eval cases. The very small SmolLM2 bundled with mimOE Studio is unlikely to emit reliable native `tool_calls`. For tiny models I'd add a fallback that parses a JSON tool call out of plain text.
-- **Latency:** about 10–16 s per question on a 4B model, mostly spent reading the tool JSON back in. Slimmer tool outputs and streaming the final answer would help.
-- Sessions are kept in memory, which is fine for a single local process.
+
+- **Model size:** tiny models (e.g. SmolLM2) don't emit reliable tool calls. They would need a text-parsing fallback.
+- **Latency:** 5–17 s per question. Streaming and smaller tool outputs would help.
+- **Evals:** single runs of a small set. Repeated runs and more adversarial cases are next.
+- **Metric simplifications:** "yesterday" means the last 24 hours, an episode ends at the first in-range reading, and timestamps have no timezone.
+- **Safety rules are keyword-based.** They are tested against paraphrases and look-alike characters, but a determined rewording can still slip past the question check. The answer check is the second line of defence. A small on-device classifier would be the next step.
+- **Single user:** in-memory sessions and no API auth. `/health` stops checking mimOE once a model has been resolved.
+- **Privacy:** with a Logfire token, traces (including glucose values) go to Logfire's cloud. Real data would need a local collector.
 
 ## Project layout
 
 ```
 mimoe_agent/
-  config.py         settings from env/.env (pydantic-settings)
-  cgm.py            loading + deterministic glucose metrics (mmol/L)
-  tools.py          @function_tool wrappers, validated args, error feedback to the model
-  agent.py          mimOE client, model resolution, Agent, run + error mapping, Logfire span
-  api.py            FastAPI: /chat, /chat/{id}, /health
-  observability.py  Logfire setup (Agents SDK + FastAPI instrumentation)
+  config.py         settings from .env
+  cgm.py            data loading and glucose metrics
+  tools.py          tools the model can call
+  safety.py         guardrails and out-of-range alerts
+  agent.py          mimOE client, agent, error handling
+  api.py            FastAPI endpoints
+  observability.py  Logfire setup
 main.py             CLI
-evals/              test set + runner
-tests/              offline unit tests + live API tests
-scripts/            mock data generator, agent graph renderer
-data/cgm_mock.csv   14 days of synthetic CGM data
-docs/agent_graph.png
+evals/              eval set and runner
+tests/              offline and live tests
+scripts/            agent graph renderer
+data/cgm_mock.csv   synthetic CGM data
 ```
 
 ## On using AI assistants
+
 I built this with Claude Code as a pair programmer. I set the scope and the design choices: mimOE as the only inference engine, pydantic, FastAPI, Logfire, mmol/L, evals, and live tests instead of mocked ones. I reviewed the generated code and pushed back where it was over-engineered. The evals and unit tests are there so that the code's correctness doesn't depend on trusting the AI that helped write it.

@@ -27,7 +27,7 @@ from agents import (
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, NotFoundError
 from pydantic import BaseModel
 
-from . import cgm
+from . import cgm, safety
 from .config import Settings, get_settings
 from .tools import CGM_TOOLS, CGMContext
 
@@ -42,8 +42,9 @@ quote the values the tool returns, with units.
 - Report GMI / estimated A1c as a percentage (gmi_pct, e.g. "6.3%"); you may add the mmol/mol value after it.
 - Pick `days` from the question: today/yesterday/last 24h = 1, this week = 7, two weeks = 14. Default to 7.
 - Keep answers short: 2-4 sentences in plain language, then at most one practical, non-prescriptive observation.
-- You are not a clinician. Do not diagnose conditions or recommend medication or insulin doses; for those, \
-suggest talking to their healthcare provider.
+- You are not a clinician and never give medical advice: no doses, no medication or treatment changes, \
+no diagnoses. For any of those, tell the user to talk to their healthcare provider.
+- Safety notes about out-of-range glucose are added to your answer automatically; don't repeat them.
 
 The most recent CGM reading is from {latest:%A %Y-%m-%d %H:%M}. Treat that as "now".\
 """
@@ -71,6 +72,16 @@ class AgentResult(BaseModel):
     tool_calls: list[ToolCallRecord]
     latency_ms: int
     model: str
+    # Set when a guardrail replaced the model's answer (or the model was never called).
+    blocked: safety.BlockReason | None = None
+    # Data-driven safety notes; their messages are also appended to `answer` so a plain-text reader sees them.
+    alerts: list[safety.SafetyAlert] = []
+
+    def with_alerts(self, alerts: list[safety.SafetyAlert]) -> "AgentResult":
+        if not alerts:
+            return self
+        notes = "\n\n".join(f"⚠️ {alert.message}" for alert in alerts)
+        return self.model_copy(update={"answer": f"{self.answer}\n\n{notes}", "alerts": alerts})
 
 
 def strip_think(text: str | None) -> str:
@@ -88,7 +99,7 @@ def create_client(settings: Settings) -> AsyncOpenAI:
     timeouts, 408/409/429 and 5xx with exponential backoff and jitter, up to `max_retries` times."""
     return AsyncOpenAI(
         base_url=settings.base_url,
-        api_key=settings.api_key,
+        api_key=settings.api_key.get_secret_value(),
         max_retries=settings.max_retries,
         timeout=settings.timeout_s,
     )
@@ -229,4 +240,26 @@ class CGMAssistant:
         return self._agent
 
     async def ask(self, message: str, session: Session | None = None) -> AgentResult:
-        return await run_agent(await self.agent(), message, self.context, self.settings, session)
+        """Answer one question with the safety layer around the model (see safety.py)."""
+        alerts = safety.glucose_alerts(self.context.readings)
+        urgent_alerts = [alert for alert in alerts if alert.level == "urgent"]
+
+        # 1. Medical-advice questions never reach the model (and work even when mimOE is down).
+        blocked = safety.check_question(message)
+        if blocked:
+            logfire.warn("question blocked by guardrail: {reason}", reason=blocked)
+            refusal = AgentResult(
+                answer=safety.REPLIES[blocked], tool_calls=[], latency_ms=0, model="guardrail", blocked=blocked
+            )
+            return refusal.with_alerts(urgent_alerts)
+
+        result = await run_agent(await self.agent(), message, self.context, self.settings, session)
+
+        # 2. If the model gave medical advice anyway, replace the answer.
+        if safety.check_answer(result.answer):
+            logfire.warn("answer blocked by guardrail", answer=result.answer)
+            result = result.model_copy(update={"answer": safety.REPLIES["unsafe_answer"], "blocked": "unsafe_answer"})
+
+        # 3. Out-of-range data always gets a referral: urgent notes on every answer, the 14-day advisory on
+        #    answers about the data.
+        return result.with_alerts(alerts if result.tool_calls else urgent_alerts)

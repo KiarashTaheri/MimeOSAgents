@@ -11,6 +11,7 @@ from agents import SQLiteSession
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from . import safety
 from .agent import AgentError, CGMAssistant, MimoeUnavailableError, ToolCallRecord
 from .observability import setup_observability
 
@@ -29,6 +30,8 @@ class ChatResponse(BaseModel):
     tool_calls: list[ToolCallRecord]
     latency_ms: int
     model: str
+    blocked: safety.BlockReason | None = Field(default=None, description="Set when a safety guardrail answered.")
+    alerts: list[safety.SafetyAlert] = Field(default=[], description="Out-of-range glucose notes.")
 
 
 class HealthResponse(BaseModel):

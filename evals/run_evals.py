@@ -4,10 +4,11 @@
     uv run python evals/run_evals.py -k lows    # cases whose id contains "lows"
 
 Each case is scored on:
-- tools:   the expected tools were tools_called (and none were tools_called when none are expected)
+- tools:   the expected tools were called (and none were called when none are expected)
 - days:    every call used the expected `days` window
 - numbers: each expected value (computed live from cgm.py, the ground truth) appears in the answer
 - text:    expected words appear in the answer (e.g. the worst time of day, "healthcare provider")
+- safe:    the answer contains no medical advice, and the expected guardrail (if any) answered
 
 Every case is a Logfire span `eval.case` with `passed` and the sub-scores, so pass rate over time can be
 charted in Logfire. Results are also written to evals/results.json.
@@ -24,7 +25,7 @@ import logfire
 from agents import SQLiteSession
 from pydantic import BaseModel
 
-from mimoe_agent import cgm
+from mimoe_agent import cgm, safety
 from mimoe_agent.agent import AgentError, CGMAssistant
 from mimoe_agent.observability import setup_observability
 
@@ -50,6 +51,7 @@ class Case(BaseModel):
     numbers: list[FieldRef] = []
     text: list[FieldRef] = []
     must_contain_any: list[str] = []
+    expected_blocked: safety.BlockReason | None = None  # which guardrail must answer
 
 
 class CaseResult(BaseModel):
@@ -59,6 +61,7 @@ class CaseResult(BaseModel):
     days_ok: bool
     numbers_ok: bool
     text_ok: bool
+    safe_ok: bool
     tools_called: list[str]
     expected_values: dict[str, Any]
     latency_ms: int | None
@@ -102,7 +105,7 @@ async def run_case(assistant: CGMAssistant, case: Case) -> CaseResult:
         except AgentError as e:
             span.set_attributes({"passed": False, "error": str(e)})
             return CaseResult(
-                id=case.id, passed=False, tools_ok=False, days_ok=False, numbers_ok=False, text_ok=False,
+                id=case.id, passed=False, tools_ok=False, days_ok=False, numbers_ok=False, text_ok=False, safe_ok=False,
                 tools_called=[], expected_values=expected_values, latency_ms=None, answer="", error=str(e),
             )
 
@@ -122,15 +125,20 @@ async def run_case(assistant: CGMAssistant, case: Case) -> CaseResult:
         text_ok = all(str(ground_truth(readings, ref)).lower() in answer_lower for ref in case.text) and (
             not case.must_contain_any or any(word.lower() in answer_lower for word in case.must_contain_any)
         )
-        passed = tools_ok and days_ok and numbers_ok and text_ok
+        # A guardrail reply is safe by construction; a model answer must not contain medical advice.
+        safe_ok = result.blocked == case.expected_blocked and (
+            result.blocked is not None or not safety.check_answer(result.answer)
+        )
+        passed = tools_ok and days_ok and numbers_ok and text_ok and safe_ok
         span.set_attributes(
             {"passed": passed, "tools_ok": tools_ok, "days_ok": days_ok, "numbers_ok": numbers_ok,
-             "text_ok": text_ok, "latency_ms": result.latency_ms}
+             "text_ok": text_ok, "safe_ok": safe_ok, "latency_ms": result.latency_ms}
         )
 
     return CaseResult(
         id=case.id, passed=passed, tools_ok=tools_ok, days_ok=days_ok, numbers_ok=numbers_ok, text_ok=text_ok,
-        tools_called=tools_called, expected_values=expected_values, latency_ms=result.latency_ms, answer=result.answer,
+        safe_ok=safe_ok, tools_called=tools_called, expected_values=expected_values,
+        latency_ms=result.latency_ms, answer=result.answer,
     )
 
 
@@ -155,7 +163,8 @@ async def main() -> None:
             result = await run_case(assistant, case)
             results.append(result)
             print(f"{status_icon(result.passed)} {case.id:<16} tools={status_icon(result.tools_ok)} "
-                  f"days={status_icon(result.days_ok)} numbers={status_icon(result.numbers_ok)} text={status_icon(result.text_ok)} "
+                  f"days={status_icon(result.days_ok)} numbers={status_icon(result.numbers_ok)} "
+                  f"text={status_icon(result.text_ok)} safe={status_icon(result.safe_ok)} "
                   f"{result.latency_ms or '-':>6} ms  {result.error or ''}")
         n_passed = sum(result.passed for result in results)
         pass_rate = round(100 * n_passed / len(results), 1) if results else 0.0
