@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from mimoe_agent import api
+from mimoe_agent.agent import build_agent
 from mimoe_agent.config import get_settings
 
 pytestmark = pytest.mark.live
@@ -97,3 +98,13 @@ def test_empty_message_is_rejected(settings_env):
     settings_env(MIMOE_BASE_URL=CLOSED_PORT_URL)
     with TestClient(api.app) as client:
         assert client.post("/chat", json={"message": ""}).status_code == 422
+
+
+def test_health_notices_mimoe_going_down_after_startup(settings_env):
+    # The agent was built while mimOE was up; mimOE then goes away (closed port).
+    settings_env(MIMOE_BASE_URL=CLOSED_PORT_URL)
+    with TestClient(api.app) as client:
+        assistant = api.app.state.assistant
+        assistant._agent = build_agent(assistant.client, "qwen3-4b", assistant.settings)
+        health = client.get("/health").json()
+    assert health["status"] == "degraded" and health["mimoe_reachable"] is False
