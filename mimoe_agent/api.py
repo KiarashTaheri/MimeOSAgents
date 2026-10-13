@@ -51,7 +51,14 @@ async def lifespan(app: FastAPI):
 
 setup_observability()  # before instrument_fastapi, which needs a configured Logfire
 app = FastAPI(title="mimOE CGM Agent", version="0.1.0", lifespan=lifespan)
-logfire.instrument_fastapi(app)
+
+
+def _drop_request_values(request, attributes: dict) -> dict:
+    """Keep validation errors in FastAPI spans, but not the request body (the user's question)."""
+    return {"errors": attributes["errors"]} if attributes.get("errors") else {}
+
+
+logfire.instrument_fastapi(app, request_attributes_mapper=_drop_request_values)
 
 
 def _get_assistant(request: Request) -> CGMAssistant:
@@ -84,7 +91,7 @@ async def health(request: Request) -> HealthResponse:
     assistant = _get_assistant(request)
     reading_count = len(assistant.context.readings)
     try:
-        agent = await assistant.agent()
+        model = await assistant.check_mimoe()
     except MimoeUnavailableError as e:
         return HealthResponse(status="degraded", mimoe_reachable=False, model=None, cgm_readings=reading_count, detail=str(e))
-    return HealthResponse(status="ok", mimoe_reachable=True, model=str(agent.model.model), cgm_readings=reading_count)
+    return HealthResponse(status="ok", mimoe_reachable=True, model=model, cgm_readings=reading_count)

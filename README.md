@@ -93,7 +93,7 @@ The API returns this as structured data alongside the text: `blocked` names the 
 | **Deterministic tools** | The model chooses tools and explains results. All math lives in `cgm.py`. |
 | **Pydantic** | One type defines each tool's schema and validates the model's arguments. Settings and API bodies are typed too. |
 | **FastAPI** | `/chat` with sessions, `/health`, typed responses. |
-| **Logfire** (optional) | Traces each request, model call and tool, with success and latency per run. |
+| **Logfire** (optional) | Traces execution only: each request, model call and tool, with timings, success and errors. Questions, answers and glucose values are never recorded. |
 | **mmol/L** | International Consensus thresholds. Dexcom mg/dL exports are converted on load. |
 
 **mimOE specifics:** tool calling works, including several calls in one reply. Qwen3's `<think>` reasoning arrives inside the answer and is stripped. `/no_think` is added by default to cut latency. `/responses` isn't supported, so the agent uses chat completions. If `MIMOE_MODEL` is unset, the loaded model is used.
@@ -163,8 +163,7 @@ To use your own data, set `MIMOE_CGM_PATH`. The loader supports a simple `timest
 - **Evals:** single runs of a small set. Repeated runs and more adversarial cases are next.
 - **Metric simplifications:** "yesterday" means the last 24 hours, an episode ends at the first in-range reading, and timestamps have no timezone.
 - **Safety rules are keyword-based.** They are tested against paraphrases and look-alike characters, but a determined rewording can still slip past the question check. The answer check is the second line of defence. A small on-device classifier would be the next step.
-- **Single user:** in-memory sessions and no API auth. `/health` stops checking mimOE once a model has been resolved.
-- **Privacy:** with a Logfire token, traces (including glucose values) go to Logfire's cloud. Real data would need a local collector.
+- **Single user:** in-memory sessions and no API auth.
 
 ## Project layout
 

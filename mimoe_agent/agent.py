@@ -18,6 +18,7 @@ from agents import (
     ModelBehaviorError,
     ModelSettings,
     OpenAIChatCompletionsModel,
+    RunConfig,
     RunContextWrapper,
     Runner,
     Session,
@@ -50,6 +51,9 @@ The most recent CGM reading is from {latest:%A %Y-%m-%d %H:%M}. Treat that as "n
 """
 
 NUDGE = "Please answer my previous question directly, using a tool if you need data."
+# Traces record execution (steps, tools, timings), never prompts, answers or tool inputs/outputs.
+RUN_CONFIG = RunConfig(trace_include_sensitive_data=False)
+HEALTH_CHECK_TIMEOUT_S = 3
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
@@ -172,15 +176,19 @@ async def run_agent(
     """Answer one user turn, with error mapping and a Logfire span carrying success metrics."""
     started_at = time.perf_counter()
     model_name = str(getattr(agent.model, "model", agent.model))
-    with logfire.span("agent.run", model=model_name, question=message) as span:
+    with logfire.span("agent.run", model=model_name) as span:
         try:
-            result = await Runner.run(agent, message, context=context, session=session, max_turns=settings.max_steps)
+            result = await Runner.run(
+                agent, message, context=context, session=session, max_turns=settings.max_steps, run_config=RUN_CONFIG
+            )
             answer = strip_think(result.final_output)
             run_items = list(result.new_items)
             if not answer:
                 # Small models occasionally end a turn with nothing but an empty <think> block.
                 logfire.warn("empty model response, nudging once")
-                result = await Runner.run(agent, NUDGE, context=context, session=session, max_turns=settings.max_steps)
+                result = await Runner.run(
+                    agent, NUDGE, context=context, session=session, max_turns=settings.max_steps, run_config=RUN_CONFIG
+                )
                 answer = strip_think(result.final_output)
                 run_items += result.new_items
             if not answer:
@@ -215,7 +223,6 @@ async def run_agent(
                 "tool_errors": sum(not call.ok for call in tool_calls),
                 "tools_used": [call.name for call in tool_calls],
                 "latency_ms": latency_ms,
-                "answer": answer,
             }
         )
     return AgentResult(answer=answer, tool_calls=tool_calls, latency_ms=latency_ms, model=model_name)
@@ -239,6 +246,14 @@ class CGMAssistant:
             self._agent = build_agent(self.client, model, self.settings)
         return self._agent
 
+    async def check_mimoe(self) -> str:
+        """Ask mimOE right now which model is loaded. Never cached, so health checks see outages.
+
+        Uses a short timeout and no retries: a health check should answer in seconds, not minutes.
+        """
+        quick_client = self.client.with_options(timeout=HEALTH_CHECK_TIMEOUT_S, max_retries=0)
+        return await resolve_model(quick_client, self.settings)
+
     async def ask(self, message: str, session: Session | None = None) -> AgentResult:
         """Answer one question with the safety layer around the model (see safety.py)."""
         alerts = safety.glucose_alerts(self.context.readings)
@@ -257,7 +272,7 @@ class CGMAssistant:
 
         # 2. If the model gave medical advice anyway, replace the answer.
         if safety.check_answer(result.answer):
-            logfire.warn("answer blocked by guardrail", answer=result.answer)
+            logfire.warn("answer blocked by guardrail")
             result = result.model_copy(update={"answer": safety.REPLIES["unsafe_answer"], "blocked": "unsafe_answer"})
 
         # 3. Out-of-range data always gets a referral: urgent notes on every answer, the 14-day advisory on
